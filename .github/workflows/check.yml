@@ -4,7 +4,8 @@ on:
   schedule:
     # Co 10 minut do końca maja
     # Od 1 czerwca zmień "*/10" na "*/30"
-    - cron: "*/10 * * * *"
+    - cron: "1,11,21,31,41,51 * * * *"
+
   # Pozwala też odpalić ręcznie z GitHuba (przydatne do testowania)
   workflow_dispatch:
 
