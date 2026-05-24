@@ -57,6 +57,32 @@ def save_seen(seen):
     with open(SEEN_FILE, "w") as f:
         json.dump(seen, f, ensure_ascii=False, indent=2)
 
+def znajdz_ads_w_dict(data, depth=0):
+    """
+    Rekurencyjnie szuka klucza 'ads' w zagnieżdżonym słowniku.
+    Zwraca pierwszą listę która wygląda jak lista ofert (ma id i title).
+    """
+    if depth > 10:
+        return None
+    if isinstance(data, dict):
+        # Sprawdzamy czy ten słownik ma klucz 'ads' z listą
+        if "ads" in data and isinstance(data["ads"], list) and len(data["ads"]) > 0:
+            # Sprawdzamy czy to wygląda jak oferty OLX
+            pierwszy = data["ads"][0]
+            if isinstance(pierwszy, dict) and "id" in pierwszy:
+                return data["ads"]
+        # Szukamy rekurencyjnie w wartościach
+        for key, val in data.items():
+            wynik = znajdz_ads_w_dict(val, depth + 1)
+            if wynik:
+                return wynik
+    elif isinstance(data, list):
+        for item in data:
+            wynik = znajdz_ads_w_dict(item, depth + 1)
+            if wynik:
+                return wynik
+    return None
+
 def pobierz_oferty(url):
     try:
         resp = requests.get(url, headers=HEADERS, timeout=20)
@@ -68,20 +94,119 @@ def pobierz_oferty(url):
     print(f"Pobrano stronę: {len(resp.text)} znaków")
     soup = BeautifulSoup(resp.text, "html.parser")
 
-    # Wypisujemy WSZYSTKIE tagi script żeby znaleźć ten z ofertami
-    print("=== WSZYSTKIE TAGI SCRIPT ===")
-    for i, s in enumerate(soup.find_all("script")):
-        sid = s.get("id", "")
-        content = s.string or ""
-        # Szukamy tagów które mogą zawierać oferty
-        interesujacy = any(kw in content for kw in [
-            "ads", "listing", "offers", "PRERENDERED", "NEXT_DATA",
-            "pageProps", "title", "price"
-        ])
-        if interesujacy or sid:
-            print(f"  [{i}] id='{sid}' len={len(content)} | {content[:150].replace(chr(10),' ')}")
+    # Szukamy tagu olx-init-config który zawiera 3MB danych
+    script_tag = soup.find("script", {"id": "olx-init-config"})
+    if not script_tag or not script_tag.string:
+        print("Brak tagu olx-init-config")
+        return []
 
-    return []
+    raw = script_tag.string.strip()
+
+    # OLX zapisuje tam: window.__INIT_CONFIG__ = "{ JSON jako string }"
+    # Musimy wyciągnąć wartość po = i odpakować podwójną serializację
+    match = re.search(r'window\.__INIT_CONFIG__\s*=\s*"(.+)";\s*$', raw, re.DOTALL)
+    if not match:
+        # Próbujemy bez cudzysłowów
+        match = re.search(r'window\.__INIT_CONFIG__\s*=\s*(\{.+\})\s*;?\s*$', raw, re.DOTALL)
+        if not match:
+            print("Nie znaleziono __INIT_CONFIG__ w tagu")
+            print(f"Pierwsze 300 znaków tagu: {raw[:300]}")
+            return []
+        json_str = match.group(1)
+    else:
+        # Odpakowanie: string był serializowany dwukrotnie, odkodowujemy escape'y
+        json_str = match.group(1).encode().decode("unicode_escape")
+
+    try:
+        data = json.loads(json_str)
+    except json.JSONDecodeError as e:
+        print(f"Błąd parsowania JSON pierwszej warstwy: {e}")
+        # Może dane ofert są w innym kluczu - szukamy "listing" w surowym tekście
+        # i próbujemy wyciągnąć fragment
+        listing_match = re.search(r'"listing"\s*:\s*(\{[^}]{100,}\})', raw[:50000])
+        if listing_match:
+            print(f"Znaleziono fragment listing: {listing_match.group(0)[:200]}")
+        return []
+
+    print(f"Sparsowano JSON, klucze główne: {list(data.keys())[:10]}")
+
+    # Sprawdzamy czy jest klucz listing lub podobny
+    for key in data.keys():
+        if "listing" in key.lower() or "offer" in key.lower() or "ad" in key.lower():
+            print(f"Interesujący klucz: {key} -> typ: {type(data[key])}")
+
+    # Szukamy listy ofert rekurencyjnie
+    ads = znajdz_ads_w_dict(data)
+
+    if not ads:
+        print(f"Nie znaleziono listy ofert. Klucze główne: {list(data.keys())}")
+        # Sprawdzamy czy wartości kluczy to stringi (kolejna warstwa serializacji)
+        for key, val in list(data.items())[:5]:
+            if isinstance(val, str) and len(val) > 100:
+                print(f"Klucz '{key}' zawiera string długości {len(val)}, próba parsowania...")
+                try:
+                    subdata = json.loads(val)
+                    sub_ads = znajdz_ads_w_dict(subdata)
+                    if sub_ads:
+                        print(f"Znaleziono oferty w kluczu '{key}'!")
+                        ads = sub_ads
+                        break
+                except json.JSONDecodeError:
+                    pass
+        if not ads:
+            return []
+
+    print(f"Znaleziono {len(ads)} ogłoszeń łącznie")
+
+    oferty = []
+    for ad in ads:
+        try:
+            oferta_id = str(ad.get("id", ""))
+            tytul = ad.get("title", "Brak tytułu")
+            link = ad.get("url", "")
+
+            params_dict = {}
+            for p in ad.get("params", []):
+                key = p.get("key", "")
+                val = p.get("value", {})
+                if isinstance(val, dict):
+                    params_dict[key] = val.get("value")
+                else:
+                    params_dict[key] = val
+
+            cena_raw = params_dict.get("price")
+            powierzchnia_raw = params_dict.get("m")
+
+            if cena_raw is None or powierzchnia_raw is None:
+                continue
+
+            cena = float(
+                str(cena_raw)
+                .replace(" ", "")
+                .replace("\xa0", "")
+                .replace(",", ".")
+            )
+            powierzchnia = float(str(powierzchnia_raw).replace(",", "."))
+
+            if not (POWIERZCHNIA_MIN <= powierzchnia <= POWIERZCHNIA_MAX):
+                continue
+
+            cena_m2 = round(cena / powierzchnia)
+
+            oferty.append({
+                "id": oferta_id,
+                "tytul": tytul,
+                "url": link,
+                "cena": int(cena),
+                "powierzchnia": powierzchnia,
+                "cena_m2": cena_m2,
+            })
+
+        except (ValueError, TypeError, KeyError) as e:
+            print(f"Pomijam ofertę z błędem: {e}")
+            continue
+
+    return oferty
 
 def wyslij_maila(nowe_oferty, zmienione_oferty):
     gmail_user = os.environ["GMAIL_USER"]
