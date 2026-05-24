@@ -14,7 +14,6 @@ from datetime import datetime
 
 POWIERZCHNIA_MIN = 35
 POWIERZCHNIA_MAX = 45
-
 CENA_M2_WTORNY_MAX = 7800
 CENA_M2_PIERWOTNY_MAX = 9000
 
@@ -37,10 +36,6 @@ URL_PIERWOTNY = (
 )
 
 SEEN_FILE = "seen_offers.json"
-
-# ============================================================
-# FUNKCJE
-# ============================================================
 
 HEADERS = {
     "User-Agent": (
@@ -70,126 +65,23 @@ def pobierz_oferty(url):
         print(f"Błąd pobierania strony: {e}")
         return []
 
-    print(f"Pobrano stronę: {len(resp.text)} znaków, status: {resp.status_code}")
+    print(f"Pobrano stronę: {len(resp.text)} znaków")
     soup = BeautifulSoup(resp.text, "html.parser")
 
-    raw_json = None
-    metoda = None
+    # Wypisujemy WSZYSTKIE tagi script żeby znaleźć ten z ofertami
+    print("=== WSZYSTKIE TAGI SCRIPT ===")
+    for i, s in enumerate(soup.find_all("script")):
+        sid = s.get("id", "")
+        content = s.string or ""
+        # Szukamy tagów które mogą zawierać oferty
+        interesujacy = any(kw in content for kw in [
+            "ads", "listing", "offers", "PRERENDERED", "NEXT_DATA",
+            "pageProps", "title", "price"
+        ])
+        if interesujacy or sid:
+            print(f"  [{i}] id='{sid}' len={len(content)} | {content[:150].replace(chr(10),' ')}")
 
-    # Metoda 1: tag script z id="olx-init-config"
-    script_tag = soup.find("script", {"id": "olx-init-config"})
-    if script_tag and script_tag.string:
-        raw_json = script_tag.string
-        metoda = "olx-init-config"
-
-    # Metoda 2: window.__PRERENDERED_STATE__
-    if not raw_json:
-        for script in soup.find_all("script"):
-            if script.string and "__PRERENDERED_STATE__" in script.string:
-                match = re.search(
-                    r'window\.__PRERENDERED_STATE__\s*=\s*({.*?});?\s*\n',
-                    script.string,
-                    re.DOTALL
-                )
-                if match:
-                    raw_json = match.group(1)
-                    metoda = "PRERENDERED_STATE"
-                    break
-
-    # Metoda 3: __NEXT_DATA__
-    if not raw_json:
-        script_tag = soup.find("script", {"id": "__NEXT_DATA__"})
-        if script_tag and script_tag.string:
-            raw_json = script_tag.string
-            metoda = "__NEXT_DATA__"
-
-    if not raw_json:
-        print("Nie znaleziono danych JSON - lista tagów script:")
-        for i, s in enumerate(soup.find_all("script")):
-            sid = s.get("id", "brak-id")
-            stype = s.get("type", "brak-type")
-            content_preview = (s.string or "")[:80].replace("\n", " ")
-            print(f"  script[{i}] id={sid} type={stype} | {content_preview}")
-        return []
-
-    print(f"Znaleziono JSON metodą: {metoda}, długość: {len(raw_json)} znaków")
-    print(f"Pierwsze 200 znaków JSON: {raw_json[:200]}")
-
-    try:
-        data = json.loads(raw_json)
-    except json.JSONDecodeError as e:
-        print(f"Błąd parsowania JSON: {e}")
-        print(f"Fragment przy błędzie (char {e.pos}): '{raw_json[max(0,e.pos-80):e.pos+80]}'")
-        return []
-
-    # Szukamy listy ofert w różnych miejscach struktury
-    ads = (
-        data.get("listing", {})
-        .get("listing", {})
-        .get("ads", [])
-    )
-    if not ads:
-        ads = (
-            data.get("props", {})
-            .get("pageProps", {})
-            .get("ads", [])
-        )
-    if not ads:
-        ads = data.get("ads", [])
-
-    if not ads:
-        print(f"Znaleziono JSON ale brak listy ofert. Klucze główne: {list(data.keys())}")
-        return []
-
-    oferty = []
-    for ad in ads:
-        try:
-            oferta_id = str(ad.get("id", ""))
-            tytul = ad.get("title", "Brak tytułu")
-            link = ad.get("url", "")
-
-            params_dict = {}
-            for p in ad.get("params", []):
-                key = p.get("key", "")
-                val = p.get("value", {})
-                if isinstance(val, dict):
-                    params_dict[key] = val.get("value")
-                else:
-                    params_dict[key] = val
-
-            cena_raw = params_dict.get("price")
-            powierzchnia_raw = params_dict.get("m")
-
-            if cena_raw is None or powierzchnia_raw is None:
-                continue
-
-            cena = float(
-                str(cena_raw)
-                .replace(" ", "")
-                .replace("\xa0", "")
-                .replace(",", ".")
-            )
-            powierzchnia = float(str(powierzchnia_raw).replace(",", "."))
-
-            if not (POWIERZCHNIA_MIN <= powierzchnia <= POWIERZCHNIA_MAX):
-                continue
-
-            cena_m2 = round(cena / powierzchnia)
-
-            oferty.append({
-                "id": oferta_id,
-                "tytul": tytul,
-                "url": link,
-                "cena": int(cena),
-                "powierzchnia": powierzchnia,
-                "cena_m2": cena_m2,
-            })
-
-        except (ValueError, TypeError, KeyError) as e:
-            print(f"Pomijam ofertę z błędem: {e}")
-            continue
-
-    return oferty
+    return []
 
 def wyslij_maila(nowe_oferty, zmienione_oferty):
     gmail_user = os.environ["GMAIL_USER"]
@@ -244,14 +136,11 @@ def sprawdz_rynek(url, rynek, cena_m2_max, seen):
     nowe = []
     zmienione = []
     nazwa = "wtórny" if rynek == "secondary" else "pierwotny"
-
     oferty = pobierz_oferty(url)
     print(f"Rynek {nazwa}: znaleziono {len(oferty)} ofert w przedziale m²")
-
     for o in oferty:
         oferta_id = o["id"]
         cena_m2 = o["cena_m2"]
-
         if oferta_id in seen:
             stara_cena_m2 = seen[oferta_id]["cena_m2"]
             if cena_m2 != stara_cena_m2:
@@ -259,39 +148,23 @@ def sprawdz_rynek(url, rynek, cena_m2_max, seen):
                 if cena_m2 <= cena_m2_max:
                     o["stara_cena_m2"] = stara_cena_m2
                     zmienione.append(o)
-                    print(f"Zmiana ceny: {o['tytul']} — {stara_cena_m2} → {cena_m2} zł/m²")
         else:
-            seen[oferta_id] = {
-                "tytul": o["tytul"],
-                "cena_m2": cena_m2,
-                "rynek": nazwa,
-            }
+            seen[oferta_id] = {"tytul": o["tytul"], "cena_m2": cena_m2, "rynek": nazwa}
             if cena_m2 <= cena_m2_max:
                 nowe.append(o)
-                print(f"Nowa oferta: {o['tytul']} — {cena_m2} zł/m²")
-
     return nowe, zmienione
 
 def main():
     print(f"Start: {datetime.now().strftime('%d.%m.%Y %H:%M:%S')}")
-
     seen = load_seen()
-
-    nowe_wtorny, zmienione_wtorny = sprawdz_rynek(
-        URL_WTORNY, "secondary", CENA_M2_WTORNY_MAX, seen
-    )
-    nowe_pierwotny, zmienione_pierwotny = sprawdz_rynek(
-        URL_PIERWOTNY, "primary", CENA_M2_PIERWOTNY_MAX, seen
-    )
-
+    nowe_wtorny, zmienione_wtorny = sprawdz_rynek(URL_WTORNY, "secondary", CENA_M2_WTORNY_MAX, seen)
+    nowe_pierwotny, zmienione_pierwotny = sprawdz_rynek(URL_PIERWOTNY, "primary", CENA_M2_PIERWOTNY_MAX, seen)
     wszystkie_nowe = nowe_wtorny + nowe_pierwotny
     wszystkie_zmienione = zmienione_wtorny + zmienione_pierwotny
-
     if wszystkie_nowe or wszystkie_zmienione:
         wyslij_maila(wszystkie_nowe, wszystkie_zmienione)
     else:
         print("Brak nowych ofert spełniających kryteria.")
-
     save_seen(seen)
     print("Gotowe.")
 
