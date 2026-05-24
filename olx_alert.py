@@ -22,18 +22,20 @@ CENA_M2_PIERWOTNY_MAX = 9000 # max cena za m² dla rynku pierwotnego
 # ręcznie i skopiuj URL z przeglądarki w to miejsce
 URL_WTORNY = (
     "https://www.olx.pl/nieruchomosci/mieszkania/sprzedaz/lodz/"
-    "?search%5Bfilter_enum_market%5D=secondary"
-    "&search%5Bfilter_float_m%3Afrom%5D=35"
-    "&search%5Bfilter_float_m%3Ato%5D=45"
-    "&search%5Bsubregion_id%5D=381"  # Polesie
+    "?search[district_id]=295"
+    "&search[order]=created_at:desc"
+    "&search[filter_float_m:from]=35"
+    "&search[filter_float_m:to]=45"
+    "&search[filter_enum_market][0]=secondary"
 )
 
 URL_PIERWOTNY = (
     "https://www.olx.pl/nieruchomosci/mieszkania/sprzedaz/lodz/"
-    "?search%5Bfilter_enum_market%5D=primary"
-    "&search%5Bfilter_float_m%3Afrom%5D=35"
-    "&search%5Bfilter_float_m%3Ato%5D=45"
-    "&search%5Bsubregion_id%5D=381"  # Polesie
+    "?search[district_id]=295"
+    "&search[order]=created_at:desc"
+    "&search[filter_float_m:from]=35"
+    "&search[filter_float_m:to]=45"
+    "&search[filter_enum_market][0]=primary"
 )
 
 # Plik w którym bot zapamiętuje już widziane oferty
