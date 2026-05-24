@@ -1,6 +1,8 @@
 import requests
+from bs4 import BeautifulSoup
 import json
 import os
+import re
 import smtplib
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
@@ -16,25 +18,41 @@ POWIERZCHNIA_MAX = 45        # maksymalna powierzchnia w m²
 CENA_M2_WTORNY_MAX = 7800    # max cena za m² dla rynku wtórnego
 CENA_M2_PIERWOTNY_MAX = 9000 # max cena za m² dla rynku pierwotnego
 
-# ID dzielnicy Polesie w Łodzi = 295
-# Jeśli chcesz zmienić dzielnicę, wejdź na OLX, ustaw filtry
-# i sprawdź parametr search[district_id] w URL przeglądarki
-DISTRICT_ID = 295
+# URL-e skopiowane bezpośrednio z przeglądarki po ustawieniu filtrów
+# Jeśli chcesz zmienić dzielnicę/filtry - wejdź na OLX, ustaw filtry
+# ręcznie i skopiuj nowy URL tutaj
+URL_WTORNY = (
+    "https://www.olx.pl/nieruchomosci/mieszkania/sprzedaz/lodz/"
+    "?search[district_id]=295"
+    "&search[order]=created_at:desc"
+    "&search[filter_float_m:from]=35"
+    "&search[filter_float_m:to]=45"
+    "&search[filter_enum_market][0]=secondary"
+)
+
+URL_PIERWOTNY = (
+    "https://www.olx.pl/nieruchomosci/mieszkania/sprzedaz/lodz/"
+    "?search[district_id]=295"
+    "&search[order]=created_at:desc"
+    "&search[filter_float_m:from]=35"
+    "&search[filter_float_m:to]=45"
+    "&search[filter_enum_market][0]=primary"
+)
+
+SEEN_FILE = "seen_offers.json"
 
 # ============================================================
 # FUNKCJE - tutaj już nie musisz nic zmieniać
 # ============================================================
 
-SEEN_FILE = "seen_offers.json"
-
-# Nagłówki udające prawdziwą przeglądarkę
 HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
         "AppleWebKit/537.36 (KHTML, like Gecko) "
         "Chrome/124.0.0.0 Safari/537.36"
     ),
-    "Accept": "application/json",
+    "Accept-Language": "pl-PL,pl;q=0.9",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
 }
 
 def load_seen():
@@ -49,53 +67,104 @@ def save_seen(seen):
     with open(SEEN_FILE, "w") as f:
         json.dump(seen, f, ensure_ascii=False, indent=2)
 
-def pobierz_oferty(rynek):
+def pobierz_oferty(url):
     """
-    Pobiera oferty z API OLX.
-    rynek: "secondary" (wtórny) lub "primary" (pierwotny)
-    Zwraca listę słowników z danymi ofert.
+    Pobiera oferty z OLX przez scraping strony HTML.
+    OLX wbudowuje dane ofert jako JSON w tagu <script> na stronie.
     """
-    # OLX ma publiczne API którego używa własna strona
-    # Parametry są identyczne jak w URL przeglądarki
-    api_url = "https://www.olx.pl/api/v1/offers/"
-    params = {
-        "offset": 0,
-        "limit": 50,                        # ile ofert pobieramy na raz
-        "category_id": 15,                  # 15 = mieszkania
-        "region_id": 7,                     # 7 = łódź (województwo)
-        "city_id": 93063,                   # 93063 = Łódź (miasto)
-        "district_id": DISTRICT_ID,         # 295 = Polesie
-        "filter_float_m:from": POWIERZCHNIA_MIN,
-        "filter_float_m:to": POWIERZCHNIA_MAX,
-        "filter_enum_market[0]": rynek,
-        "filter_enum_type[0]": "sell",      # tylko sprzedaż
-        "sort_by": "created_at:desc",       # najnowsze pierwsze
-    }
-
     try:
-        resp = requests.get(api_url, headers=HEADERS, params=params, timeout=15)
+        resp = requests.get(url, headers=HEADERS, timeout=20)
         resp.raise_for_status()
-        data = resp.json()
     except requests.RequestException as e:
-        print(f"Błąd pobierania API ({rynek}): {e}")
+        print(f"Błąd pobierania strony: {e}")
         return []
+
+    soup = BeautifulSoup(resp.text, "html.parser")
+
+    # OLX wbudowuje wszystkie dane ofert w JSON wewnątrz tagu <script id="olx-init-config">
+    # lub jako window.__PRERENDERED_STATE__ - szukamy obu
+    raw_json = None
+
+    # Metoda 1: szukamy tagu script z id="olx-init-config"
+    script_tag = soup.find("script", {"id": "olx-init-config"})
+    if script_tag and script_tag.string:
+        raw_json = script_tag.string
+
+    # Metoda 2: szukamy window.__PRERENDERED_STATE__ w dowolnym tagu script
+    if not raw_json:
+        for script in soup.find_all("script"):
+            if script.string and "__PRERENDERED_STATE__" in script.string:
+                match = re.search(
+                    r'window\.__PRERENDERED_STATE__\s*=\s*({.*?});?\s*\n',
+                    script.string,
+                    re.DOTALL
+                )
+                if match:
+                    raw_json = match.group(1)
+                    break
+
+    # Metoda 3: szukamy nextjs __NEXT_DATA__
+    if not raw_json:
+        script_tag = soup.find("script", {"id": "__NEXT_DATA__"})
+        if script_tag and script_tag.string:
+            raw_json = script_tag.string
+
+    if not raw_json:
+        print("Nie znaleziono danych JSON na stronie OLX.")
+        print(f"Długość strony: {len(resp.text)} znaków")
+        # Zapisujemy fragment strony do debugowania
+        print("Fragment HTML (pierwsze 500 znaków body):")
+        body = soup.find("body")
+        if body:
+            print(body.get_text()[:500])
+        return []
+
+    # Parsujemy JSON i nawigujemy do listy ofert
+    try:
+        data = json.loads(raw_json)
     except json.JSONDecodeError as e:
-        print(f"Błąd parsowania JSON ({rynek}): {e}")
+        print(f"Błąd parsowania JSON: {e}")
+        return []
+
+    # Szukamy listy ofert w różnych miejscach struktury JSON
+    # (OLX czasem zmienia strukturę)
+    ads = []
+
+    # Próba 1: standardowa ścieżka
+    ads = (
+        data.get("listing", {})
+        .get("listing", {})
+        .get("ads", [])
+    )
+
+    # Próba 2: ścieżka nextjs
+    if not ads:
+        ads = (
+            data.get("props", {})
+            .get("pageProps", {})
+            .get("ads", [])
+        )
+
+    # Próba 3: płaska lista
+    if not ads:
+        ads = data.get("ads", [])
+
+    if not ads:
+        print(f"Znaleziono JSON ale brak listy ofert. Klucze: {list(data.keys())}")
         return []
 
     oferty = []
 
-    for ad in data.get("data", []):
+    for ad in ads:
         try:
             oferta_id = str(ad.get("id", ""))
             tytul = ad.get("title", "Brak tytułu")
-            url = ad.get("url", "")
+            link = ad.get("url", "")
 
-            # Wyciągamy cenę i powierzchnię z parametrów
+            # Wyciągamy parametry oferty (cena, powierzchnia)
             params_dict = {}
             for p in ad.get("params", []):
                 key = p.get("key", "")
-                # Cena jest w value.value, powierzchnia też
                 val = p.get("value", {})
                 if isinstance(val, dict):
                     params_dict[key] = val.get("value")
@@ -109,11 +178,18 @@ def pobierz_oferty(rynek):
             if cena_raw is None or powierzchnia_raw is None:
                 continue
 
-            cena = float(str(cena_raw).replace(" ", "").replace("\xa0", "").replace(",", "."))
-            powierzchnia = float(str(powierzchnia_raw).replace(",", "."))
+            # Czyścimy i konwertujemy wartości
+            cena = float(
+                str(cena_raw)
+                .replace(" ", "")
+                .replace("\xa0", "")
+                .replace(",", ".")
+            )
+            powierzchnia = float(
+                str(powierzchnia_raw)
+                .replace(",", ".")
+            )
 
-            # Sprawdzamy czy powierzchnia mieści się w przedziale
-            # (API powinno to filtrować ale lepiej sprawdzić)
             if not (POWIERZCHNIA_MIN <= powierzchnia <= POWIERZCHNIA_MAX):
                 continue
 
@@ -122,14 +198,13 @@ def pobierz_oferty(rynek):
             oferty.append({
                 "id": oferta_id,
                 "tytul": tytul,
-                "url": url,
+                "url": link,
                 "cena": int(cena),
                 "powierzchnia": powierzchnia,
                 "cena_m2": cena_m2,
             })
 
         except (ValueError, TypeError, KeyError) as e:
-            # Pomijamy oferty z nieprawidłowymi danymi
             print(f"Pomijam ofertę z błędem: {e}")
             continue
 
@@ -149,15 +224,15 @@ def wyslij_maila(nowe_oferty, zmienione_oferty):
         tresc += f"NOWE OFERTY ({len(nowe_oferty)}):\n\n"
         for o in nowe_oferty:
             tresc += f"  {o['tytul']}\n"
-            tresc += f"  Cena:        {o['cena']:,} zł\n".replace(",", " ")
+            tresc += f"  Cena:         {o['cena']:,} zł\n".replace(",", " ")
             tresc += f"  Powierzchnia: {o['powierzchnia']} m²\n"
-            tresc += f"  Cena/m²:     {o['cena_m2']:,} zł\n".replace(",", " ")
-            tresc += f"  Link:        {o['url']}\n\n"
+            tresc += f"  Cena/m²:      {o['cena_m2']:,} zł\n".replace(",", " ")
+            tresc += f"  Link:         {o['url']}\n\n"
 
     if zmienione_oferty:
         tresc += f"ZMIANY CEN ({len(zmienione_oferty)}):\n\n"
         for o in zmienione_oferty:
-            roznica = o['stara_cena_m2'] - o['cena_m2']
+            roznica = o["stara_cena_m2"] - o["cena_m2"]
             tresc += f"  {o['tytul']}\n"
             tresc += f"  Stara cena/m²: {o['stara_cena_m2']:,} zł\n".replace(",", " ")
             tresc += f"  Nowa cena/m²:  {o['cena_m2']:,} zł  (taniej o {roznica:,} zł/m²)\n".replace(",", " ")
@@ -165,7 +240,7 @@ def wyslij_maila(nowe_oferty, zmienione_oferty):
             tresc += f"  Link:          {o['url']}\n\n"
 
     tresc += "=" * 50 + "\n"
-    tresc += "Bot sprawdza OLX automatycznie.\n"
+    tresc += "Bot sprawdza OLX automatycznie co 10 minut.\n"
 
     msg = MIMEMultipart()
     msg["From"] = gmail_user
@@ -183,17 +258,18 @@ def wyslij_maila(nowe_oferty, zmienione_oferty):
         print(f"Mail wysłany do: {', '.join(odbiorcy)}")
     except Exception as e:
         print(f"Błąd wysyłania maila: {e}")
+        raise
 
-def sprawdz_rynek(rynek, cena_m2_max, seen):
+def sprawdz_rynek(url, rynek, cena_m2_max, seen):
     """
-    Sprawdza oferty dla jednego rynku i zwraca nowe i zmienione.
-    rynek: "secondary" lub "primary"
+    Sprawdza oferty dla jednego rynku.
+    Zwraca listy nowych i zmienionych ofert.
     """
     nowe = []
     zmienione = []
     nazwa = "wtórny" if rynek == "secondary" else "pierwotny"
 
-    oferty = pobierz_oferty(rynek)
+    oferty = pobierz_oferty(url)
     print(f"Rynek {nazwa}: znaleziono {len(oferty)} ofert w przedziale m²")
 
     for o in oferty:
@@ -201,24 +277,19 @@ def sprawdz_rynek(rynek, cena_m2_max, seen):
         cena_m2 = o["cena_m2"]
 
         if oferta_id in seen:
-            # Oferta już widziana — sprawdzamy czy cena się zmieniła
             stara_cena_m2 = seen[oferta_id]["cena_m2"]
-
             if cena_m2 != stara_cena_m2:
                 seen[oferta_id]["cena_m2"] = cena_m2
-                # Powiadamiamy tylko jeśli nowa cena spełnia warunek
                 if cena_m2 <= cena_m2_max:
                     o["stara_cena_m2"] = stara_cena_m2
                     zmienione.append(o)
                     print(f"Zmiana ceny: {o['tytul']} — {stara_cena_m2} → {cena_m2} zł/m²")
         else:
-            # Nowa oferta — zawsze zapamiętujemy
             seen[oferta_id] = {
                 "tytul": o["tytul"],
                 "cena_m2": cena_m2,
                 "rynek": nazwa,
             }
-            # Powiadamiamy tylko jeśli spełnia warunek cenowy
             if cena_m2 <= cena_m2_max:
                 nowe.append(o)
                 print(f"Nowa oferta: {o['tytul']} — {cena_m2} zł/m²")
@@ -231,10 +302,10 @@ def main():
     seen = load_seen()
 
     nowe_wtorny, zmienione_wtorny = sprawdz_rynek(
-        "secondary", CENA_M2_WTORNY_MAX, seen
+        URL_WTORNY, "secondary", CENA_M2_WTORNY_MAX, seen
     )
     nowe_pierwotny, zmienione_pierwotny = sprawdz_rynek(
-        "primary", CENA_M2_PIERWOTNY_MAX, seen
+        URL_PIERWOTNY, "primary", CENA_M2_PIERWOTNY_MAX, seen
     )
 
     wszystkie_nowe = nowe_wtorny + nowe_pierwotny
