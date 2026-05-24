@@ -3,7 +3,7 @@ name: OLX Alert
 on:
   schedule:
     # Co 10 minut do końca maja
-    # Od 1 czerwca zmień "*/10" na "*/30"
+    # Od 1 czerwca zmień na "1,31 * * * *" (co 30 minut)
     - cron: "1,11,21,31,41,51 * * * *"
 
   # Pozwala też odpalić ręcznie z GitHuba (przydatne do testowania)
@@ -29,13 +29,15 @@ jobs:
         run: pip install requests beautifulsoup4
 
       # Pobiera seen_offers.json z poprzedniego uruchomienia
-      # żeby bot pamiętał co już widział
+      # Klucz z run_id - kazdy run zapisuje nowy cache (cache jest immutable).
+      # restore-keys: seen-offers- - przy odczycie bierze najnowszy pasujacy.
       - name: Pobierz pamięć bota
         uses: actions/cache@v4
         with:
           path: seen_offers.json
-          key: seen-offers-${{ runner.os }}
-          restore-keys: seen-offers-
+          key: seen-offers-${{ github.run_id }}
+          restore-keys: |
+            seen-offers-
 
       # Odpala główny skrypt
       - name: Sprawdź OLX
