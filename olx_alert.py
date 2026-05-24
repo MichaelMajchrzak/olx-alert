@@ -173,6 +173,47 @@ def pobierz_oferty(url):
         print("Nie udało się wyciągnąć listy ofert z żadnego źródła.")
         return []
 
+    def liczba_z_tekstu(x):
+        """'43,34 m²' -> 43.34 ; '10 613,75 zł/m²' -> 10613.75 ; None -> None"""
+        if x is None:
+            return None
+        s = str(x).replace("\xa0", " ")
+        # zostawiamy cyfry, kropki, przecinki i minus
+        s = re.sub(r"[^\d,.\-]", "", s)
+        if not s:
+            return None
+        # jeśli są oba separatory, ostatni traktujemy jako dziesiętny
+        if "," in s and "." in s:
+            if s.rfind(",") > s.rfind("."):
+                s = s.replace(".", "").replace(",", ".")
+            else:
+                s = s.replace(",", "")
+        else:
+            s = s.replace(",", ".")
+        try:
+            return float(s)
+        except ValueError:
+            return None
+
+    def wyciagnij_cene_calkowita(ad):
+        """Cena całkowita siedzi w ad['price'] (różne warianty struktur OLX)."""
+        p = ad.get("price")
+        if isinstance(p, dict):
+            for k in ("regularPrice", "displayValue"):
+                v = p.get(k)
+                if isinstance(v, dict):
+                    val = v.get("value")
+                    if val is not None:
+                        return liczba_z_tekstu(val)
+                elif v is not None:
+                    return liczba_z_tekstu(v)
+            # czasem prosto: {"value": 350000}
+            if p.get("value") is not None:
+                return liczba_z_tekstu(p.get("value"))
+        elif p is not None:
+            return liczba_z_tekstu(p)
+        return None
+
     oferty = []
     debug_wypisane = False
     for ad in ads:
@@ -186,44 +227,49 @@ def pobierz_oferty(url):
                 key = p.get("key", "")
                 val = p.get("value", {})
                 if isinstance(val, dict):
-                    # OLX trzyma liczby w 'value' lub w 'key' (znormalizowane)
                     params_dict[key] = val.get("value") if val.get("value") is not None else val.get("key")
                 else:
                     params_dict[key] = val
 
-            # DEBUG: wypisz strukturę pierwszej oferty
             if not debug_wypisane:
                 print(f"DEBUG params pierwszej oferty: {list(params_dict.keys())}")
                 print(f"DEBUG wartosci: {params_dict}")
                 debug_wypisane = True
 
-            cena_raw = params_dict.get("price")
-            # OLX czasem trzyma powierzchnię pod różnymi kluczami
-            powierzchnia_raw = (
+            # Powierzchnia: '43,34 m²' -> 43.34
+            powierzchnia = liczba_z_tekstu(
                 params_dict.get("m")
                 or params_dict.get("area")
                 or params_dict.get("floor_area")
-                or params_dict.get("powierzchnia")
             )
-
-            if cena_raw is None or powierzchnia_raw is None:
+            if powierzchnia is None:
                 continue
-
-            cena = float(
-                str(cena_raw).replace(" ", "").replace("\xa0", "").replace(",", ".")
-            )
-            powierzchnia = float(str(powierzchnia_raw).replace(",", "."))
-
             if not (POWIERZCHNIA_MIN <= powierzchnia <= POWIERZCHNIA_MAX):
                 continue
 
-            cena_m2 = round(cena / powierzchnia)
+            # Cena/m² - OLX podaje gotową w 'price_per_m'
+            cena_m2 = liczba_z_tekstu(params_dict.get("price_per_m"))
+
+            # Cena całkowita - z ad['price'], a jeśli brak to liczona z cena_m2 * m
+            cena = wyciagnij_cene_calkowita(ad)
+            if cena is None and cena_m2 is not None:
+                cena = cena_m2 * powierzchnia
+
+            # Jeśli nie mamy cena_m2, ale mamy cenę całkowitą - liczymy
+            if cena_m2 is None and cena is not None:
+                cena_m2 = cena / powierzchnia
+
+            if cena_m2 is None:
+                continue
+
+            cena_m2 = round(cena_m2)
+            cena_int = int(cena) if cena is not None else 0
 
             oferty.append({
                 "id": oferta_id,
                 "tytul": tytul,
                 "url": link,
-                "cena": int(cena),
+                "cena": cena_int,
                 "powierzchnia": powierzchnia,
                 "cena_m2": cena_m2,
             })
