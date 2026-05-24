@@ -1,0 +1,45 @@
+name: OLX Alert
+
+on:
+  schedule:
+    # Co 10 minut do końca maja
+    # Od 1 czerwca zmień "*/10" na "*/30"
+    - cron: "*/10 * * * *"
+  # Pozwala też odpalić ręcznie z GitHuba (przydatne do testowania)
+  workflow_dispatch:
+
+jobs:
+  sprawdz-olx:
+    runs-on: ubuntu-latest
+
+    steps:
+      # Pobiera zawartość repo na serwer GitHuba
+      - name: Pobierz repo
+        uses: actions/checkout@v4
+
+      # Instaluje Python
+      - name: Ustaw Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      # Instaluje potrzebne biblioteki
+      - name: Zainstaluj biblioteki
+        run: pip install requests beautifulsoup4
+
+      # Pobiera seen_offers.json z poprzedniego uruchomienia
+      # żeby bot pamiętał co już widział
+      - name: Pobierz pamięć bota
+        uses: actions/cache@v4
+        with:
+          path: seen_offers.json
+          key: seen-offers-${{ runner.os }}
+          restore-keys: seen-offers-
+
+      # Odpala główny skrypt
+      - name: Sprawdź OLX
+        env:
+          GMAIL_USER: ${{ secrets.GMAIL_USER }}
+          GMAIL_PASSWORD: ${{ secrets.GMAIL_PASSWORD }}
+          NOTIFY_EMAILS: ${{ secrets.NOTIFY_EMAILS }}
+        run: python olx_alert.py
