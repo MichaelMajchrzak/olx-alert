@@ -79,6 +79,11 @@ def pobierz_oferty(url):
         print(f"Błąd pobierania strony: {e}")
         return []
 
+    # Tymczasowe debugowanie - zapisujemy HTML do pliku
+    with open("debug_olx.html", "w", encoding="utf-8") as f:
+        f.write(resp.text)
+    print(f"Pobrano stronę: {len(resp.text)} znaków, status: {resp.status_code}")
+
     soup = BeautifulSoup(resp.text, "html.parser")
 
     # OLX wbudowuje wszystkie dane ofert w JSON wewnątrz tagu <script id="olx-init-config">
