@@ -1,4 +1,5 @@
 import requests
+from bs4 import BeautifulSoup
 import json
 import os
 import re
@@ -8,7 +9,7 @@ from email.mime.multipart import MIMEMultipart
 from datetime import datetime
 
 # ============================================================
-# USTAWIENIA - tutaj zmieniaj parametry bez dotykania reszty
+# USTAWIENIA
 # ============================================================
 
 POWIERZCHNIA_MIN = 35
@@ -46,15 +47,66 @@ HEADERS = {
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
 }
 
+
 def load_seen():
     if os.path.exists(SEEN_FILE):
-        with open(SEEN_FILE, "r") as f:
+        with open(SEEN_FILE, "r", encoding="utf-8") as f:
             return json.load(f)
     return {}
 
+
 def save_seen(seen):
-    with open(SEEN_FILE, "w") as f:
+    with open(SEEN_FILE, "w", encoding="utf-8") as f:
         json.dump(seen, f, ensure_ascii=False, indent=2)
+
+
+def znajdz_ads_w_dict(data, depth=0):
+    """Rekurencyjnie szuka listy 'ads' z obiektami mającymi 'id'."""
+    if depth > 12:
+        return None
+    if isinstance(data, dict):
+        if "ads" in data and isinstance(data["ads"], list) and data["ads"]:
+            pierwszy = data["ads"][0]
+            if isinstance(pierwszy, dict) and "id" in pierwszy:
+                return data["ads"]
+        for val in data.values():
+            wynik = znajdz_ads_w_dict(val, depth + 1)
+            if wynik:
+                return wynik
+    elif isinstance(data, list):
+        for item in data:
+            wynik = znajdz_ads_w_dict(item, depth + 1)
+            if wynik:
+                return wynik
+    return None
+
+
+def wyciagnij_js_string(text, start_idx):
+    """
+    Od pozycji start_idx (powinien wskazywać na otwierający cudzysłów ")
+    czyta string JS z poszanowaniem backslash-escape'ów i zwraca
+    (zawartość_bez_cudzyslowow, indeks_po_zamykajacym_cudzyslowie).
+    """
+    assert text[start_idx] == '"'
+    i = start_idx + 1
+    n = len(text)
+    out = []
+    while i < n:
+        ch = text[i]
+        if ch == "\\":
+            # zachowujemy escape razem z następnym znakiem (rozwiążemy go potem)
+            if i + 1 < n:
+                out.append(text[i:i + 2])
+                i += 2
+                continue
+            else:
+                break
+        if ch == '"':
+            return "".join(out), i + 1
+        out.append(ch)
+        i += 1
+    raise ValueError("Nie znaleziono zamykającego cudzysłowu")
+
 
 def pobierz_oferty(url):
     try:
@@ -67,52 +119,59 @@ def pobierz_oferty(url):
     html = resp.text
     print(f"Pobrano stronę: {len(html)} znaków")
 
-    # OLX trzyma dane ofert w formacie:
-    # "listing":{"listing":{"ads":[{...},{...}],...},...}
-    # Szukamy tego fragmentu bezpośrednio w surowym HTML
-    match = re.search(r'"ads"\s*:\s*(\[.*?\])\s*,\s*"(?:metadata|paginationData|promotedAds|facets)"', html, re.DOTALL)
-
-    if not match:
-        print("Nie znaleziono listy ads w HTML, próbuję alternatywnego wzorca...")
-        # Alternatywny wzorzec - szukamy tablicy która zaczyna się od obiektu z "id" i "title"
-        match = re.search(r'"ads"\s*:\s*(\[\s*\{"id"\s*:\s*\d+', html)
-        if match:
-            # Musimy wyciągnąć całą tablicę - szukamy od początku match
-            start = match.start()
-            start_bracket = html.index("[", start + 7)  # pomijamy "ads":
-            # Liczymy nawiasy żeby znaleźć koniec tablicy
-            depth = 0
-            end = start_bracket
-            for i, ch in enumerate(html[start_bracket:], start_bracket):
-                if ch == "[" or ch == "{":
-                    depth += 1
-                elif ch == "]" or ch == "}":
-                    depth -= 1
-                if depth == 0:
-                    end = i + 1
-                    break
-            ads_str = html[start_bracket:end]
-        else:
-            print("Nie znaleziono ofert w HTML")
-            # Wypisujemy fragment HTML wokół słowa 'ads' do debugowania
-            pos = html.find('"ads"')
-            if pos > 0:
-                print(f"Fragment przy pierwszym 'ads' (pos {pos}): {html[pos:pos+200]}")
-            return []
-    else:
-        ads_str = match.group(1)
-
-    print(f"Znaleziono fragment ads, długość: {len(ads_str)} znaków")
-    print(f"Pierwsze 300 znaków: {ads_str[:300]}")
-
-    try:
-        ads = json.loads(ads_str)
-    except json.JSONDecodeError as e:
-        print(f"Błąd parsowania listy ads: {e}")
-        print(f"Fragment przy błędzie: {ads_str[max(0,e.pos-100):e.pos+100]}")
+    soup = BeautifulSoup(html, "html.parser")
+    script_tag = soup.find("script", {"id": "olx-init-config"})
+    if not script_tag or not script_tag.string:
+        print("Brak tagu olx-init-config")
         return []
 
-    print(f"Sparsowano {len(ads)} ogłoszeń")
+    raw = script_tag.string
+
+    # Szukamy konkretnie __PRERENDERED_STATE__ - tu siedzą oferty.
+    # Tag zawiera kilka przypisań po sobie:
+    #   window.__PRERENDERED_STATE__ = "...";
+    #   window.__INIT_CONFIG__ = "...";
+    # Stary kod brał wszystko do końca - stąd "Extra data" przy json.loads.
+    kandydaci = ["__PRERENDERED_STATE__", "__INIT_CONFIG__"]
+    ads = None
+
+    for nazwa in kandydaci:
+        m = re.search(r'window\.' + re.escape(nazwa) + r'\s*=\s*"', raw)
+        if not m:
+            continue
+        try:
+            escapowany, _ = wyciagnij_js_string(raw, m.end() - 1)
+        except ValueError as e:
+            print(f"{nazwa}: błąd wycinania stringu: {e}")
+            continue
+
+        # JS-owe escape'y -> prawdziwe znaki.
+        # encode('latin-1','backslashreplace') żeby zachować bajty unicode_escape
+        try:
+            json_str = escapowany.encode("utf-8").decode("unicode_escape")
+            # po unicode_escape mogą zostać złamane bajty UTF-8, naprawiamy:
+            json_str = json_str.encode("latin-1", "ignore").decode("utf-8", "ignore")
+        except Exception as e:
+            print(f"{nazwa}: błąd dekodowania escape: {e}")
+            continue
+
+        try:
+            data = json.loads(json_str)
+        except json.JSONDecodeError as e:
+            print(f"{nazwa}: JSONDecodeError {e}; długość: {len(json_str)}")
+            continue
+
+        ads = znajdz_ads_w_dict(data)
+        if ads:
+            print(f"Znaleziono ogłoszenia w {nazwa}: {len(ads)} szt.")
+            break
+        else:
+            print(f"{nazwa}: sparsowano JSON, ale brak listy 'ads'. "
+                  f"Klucze top: {list(data.keys())[:10] if isinstance(data, dict) else type(data)}")
+
+    if not ads:
+        print("Nie udało się wyciągnąć listy ofert z żadnego źródła.")
+        return []
 
     oferty = []
     for ad in ads:
@@ -126,7 +185,7 @@ def pobierz_oferty(url):
                 key = p.get("key", "")
                 val = p.get("value", {})
                 if isinstance(val, dict):
-                    params_dict[key] = val.get("value")
+                    params_dict[key] = val.get("value") or val.get("key")
                 else:
                     params_dict[key] = val
 
@@ -137,10 +196,7 @@ def pobierz_oferty(url):
                 continue
 
             cena = float(
-                str(cena_raw)
-                .replace(" ", "")
-                .replace("\xa0", "")
-                .replace(",", ".")
+                str(cena_raw).replace(" ", "").replace("\xa0", "").replace(",", ".")
             )
             powierzchnia = float(str(powierzchnia_raw).replace(",", "."))
 
@@ -164,10 +220,11 @@ def pobierz_oferty(url):
 
     return oferty
 
+
 def wyslij_maila(nowe_oferty, zmienione_oferty):
     gmail_user = os.environ["GMAIL_USER"]
     gmail_pass = os.environ["GMAIL_PASSWORD"]
-    odbiorcy = os.environ["NOTIFY_EMAILS"].split(",")
+    odbiorcy = [a.strip() for a in os.environ["NOTIFY_EMAILS"].split(",") if a.strip()]
 
     teraz = datetime.now().strftime("%d.%m.%Y %H:%M")
     tresc = f"OLX Alert Łódź Polesie — {teraz}\n"
@@ -199,57 +256,54 @@ def wyslij_maila(nowe_oferty, zmienione_oferty):
     msg["From"] = gmail_user
     msg["To"] = ", ".join(odbiorcy)
     msg["Subject"] = (
-        f"OLX Alert — "
-        f"{len(nowe_oferty)} nowych, {len(zmienione_oferty)} zmian cen"
+        f"OLX Alert — {len(nowe_oferty)} nowych, {len(zmienione_oferty)} zmian cen"
     )
     msg.attach(MIMEText(tresc, "plain", "utf-8"))
 
-    try:
-        with smtplib.SMTP_SSL("smtp.gmail.com", 465) as server:
-            server.login(gmail_user, gmail_pass)
-            server.sendmail(gmail_user, odbiorcy, msg.as_string())
-        print(f"Mail wysłany do: {', '.join(odbiorcy)}")
-    except Exception as e:
-        print(f"Błąd wysyłania maila: {e}")
-        raise
+    with smtplib.SMTP_SSL("smtp.gmail.com", 465) as server:
+        server.login(gmail_user, gmail_pass)
+        server.sendmail(gmail_user, odbiorcy, msg.as_string())
+    print(f"Mail wysłany do: {', '.join(odbiorcy)}")
+
 
 def sprawdz_rynek(url, rynek, cena_m2_max, seen):
-    nowe = []
-    zmienione = []
+    nowe, zmienione = [], []
     nazwa = "wtórny" if rynek == "secondary" else "pierwotny"
     oferty = pobierz_oferty(url)
-    print(f"Rynek {nazwa}: znaleziono {len(oferty)} ofert w przedziale m²")
+    print(f"Rynek {nazwa}: {len(oferty)} ofert w przedziale m²")
     for o in oferty:
-        oferta_id = o["id"]
+        oid = o["id"]
         cena_m2 = o["cena_m2"]
-        if oferta_id in seen:
-            stara_cena_m2 = seen[oferta_id]["cena_m2"]
-            if cena_m2 != stara_cena_m2:
-                seen[oferta_id]["cena_m2"] = cena_m2
+        if oid in seen:
+            stara = seen[oid]["cena_m2"]
+            if cena_m2 != stara:
+                seen[oid]["cena_m2"] = cena_m2
                 if cena_m2 <= cena_m2_max:
-                    o["stara_cena_m2"] = stara_cena_m2
+                    o["stara_cena_m2"] = stara
                     zmienione.append(o)
-                    print(f"Zmiana ceny: {o['tytul']} — {stara_cena_m2} → {cena_m2} zł/m²")
+                    print(f"Zmiana ceny: {o['tytul']} — {stara} → {cena_m2} zł/m²")
         else:
-            seen[oferta_id] = {"tytul": o["tytul"], "cena_m2": cena_m2, "rynek": nazwa}
+            seen[oid] = {"tytul": o["tytul"], "cena_m2": cena_m2, "rynek": nazwa}
             if cena_m2 <= cena_m2_max:
                 nowe.append(o)
                 print(f"Nowa oferta: {o['tytul']} — {cena_m2} zł/m²")
     return nowe, zmienione
 
+
 def main():
     print(f"Start: {datetime.now().strftime('%d.%m.%Y %H:%M:%S')}")
     seen = load_seen()
-    nowe_wtorny, zmienione_wtorny = sprawdz_rynek(URL_WTORNY, "secondary", CENA_M2_WTORNY_MAX, seen)
-    nowe_pierwotny, zmienione_pierwotny = sprawdz_rynek(URL_PIERWOTNY, "primary", CENA_M2_PIERWOTNY_MAX, seen)
-    wszystkie_nowe = nowe_wtorny + nowe_pierwotny
-    wszystkie_zmienione = zmienione_wtorny + zmienione_pierwotny
+    nowe_w, zmien_w = sprawdz_rynek(URL_WTORNY, "secondary", CENA_M2_WTORNY_MAX, seen)
+    nowe_p, zmien_p = sprawdz_rynek(URL_PIERWOTNY, "primary", CENA_M2_PIERWOTNY_MAX, seen)
+    wszystkie_nowe = nowe_w + nowe_p
+    wszystkie_zmienione = zmien_w + zmien_p
     if wszystkie_nowe or wszystkie_zmienione:
         wyslij_maila(wszystkie_nowe, wszystkie_zmienione)
     else:
         print("Brak nowych ofert spełniających kryteria.")
     save_seen(seen)
     print("Gotowe.")
+
 
 if __name__ == "__main__":
     main()
