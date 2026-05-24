@@ -1,12 +1,15 @@
 name: OLX Alert
 
 on:
+  # Trigger z cron-job.org (POST na GitHub API)
+  repository_dispatch:
+    types: [check-olx]
+
+  # Backup: scheduler GitHuba (gdyby cron-job.org padł)
   schedule:
-    # Co 10 minut do końca maja
-    # Od 1 czerwca zmień na "1,31 * * * *" (co 30 minut)
     - cron: "1,11,21,31,41,51 * * * *"
 
-  # Pozwala też odpalić ręcznie z GitHuba (przydatne do testowania)
+  # Pozwala też odpalić ręcznie z GitHuba
   workflow_dispatch:
 
 jobs:
