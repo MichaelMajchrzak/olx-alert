@@ -1,5 +1,4 @@
 import requests
-from bs4 import BeautifulSoup
 import json
 import os
 import re
@@ -57,32 +56,6 @@ def save_seen(seen):
     with open(SEEN_FILE, "w") as f:
         json.dump(seen, f, ensure_ascii=False, indent=2)
 
-def znajdz_ads_w_dict(data, depth=0):
-    """
-    Rekurencyjnie szuka klucza 'ads' w zagnieżdżonym słowniku.
-    Zwraca pierwszą listę która wygląda jak lista ofert (ma id i title).
-    """
-    if depth > 10:
-        return None
-    if isinstance(data, dict):
-        # Sprawdzamy czy ten słownik ma klucz 'ads' z listą
-        if "ads" in data and isinstance(data["ads"], list) and len(data["ads"]) > 0:
-            # Sprawdzamy czy to wygląda jak oferty OLX
-            pierwszy = data["ads"][0]
-            if isinstance(pierwszy, dict) and "id" in pierwszy:
-                return data["ads"]
-        # Szukamy rekurencyjnie w wartościach
-        for key, val in data.items():
-            wynik = znajdz_ads_w_dict(val, depth + 1)
-            if wynik:
-                return wynik
-    elif isinstance(data, list):
-        for item in data:
-            wynik = znajdz_ads_w_dict(item, depth + 1)
-            if wynik:
-                return wynik
-    return None
-
 def pobierz_oferty(url):
     try:
         resp = requests.get(url, headers=HEADERS, timeout=20)
@@ -91,72 +64,55 @@ def pobierz_oferty(url):
         print(f"Błąd pobierania strony: {e}")
         return []
 
-    print(f"Pobrano stronę: {len(resp.text)} znaków")
-    soup = BeautifulSoup(resp.text, "html.parser")
+    html = resp.text
+    print(f"Pobrano stronę: {len(html)} znaków")
 
-    # Szukamy tagu olx-init-config który zawiera 3MB danych
-    script_tag = soup.find("script", {"id": "olx-init-config"})
-    if not script_tag or not script_tag.string:
-        print("Brak tagu olx-init-config")
-        return []
+    # OLX trzyma dane ofert w formacie:
+    # "listing":{"listing":{"ads":[{...},{...}],...},...}
+    # Szukamy tego fragmentu bezpośrednio w surowym HTML
+    match = re.search(r'"ads"\s*:\s*(\[.*?\])\s*,\s*"(?:metadata|paginationData|promotedAds|facets)"', html, re.DOTALL)
 
-    raw = script_tag.string.strip()
-
-    # OLX zapisuje tam: window.__INIT_CONFIG__ = "{ JSON jako string }"
-    # Musimy wyciągnąć wartość po = i odpakować podwójną serializację
-    match = re.search(r'window\.__INIT_CONFIG__\s*=\s*"(.+)";\s*$', raw, re.DOTALL)
     if not match:
-        # Próbujemy bez cudzysłowów
-        match = re.search(r'window\.__INIT_CONFIG__\s*=\s*(\{.+\})\s*;?\s*$', raw, re.DOTALL)
-        if not match:
-            print("Nie znaleziono __INIT_CONFIG__ w tagu")
-            print(f"Pierwsze 300 znaków tagu: {raw[:300]}")
+        print("Nie znaleziono listy ads w HTML, próbuję alternatywnego wzorca...")
+        # Alternatywny wzorzec - szukamy tablicy która zaczyna się od obiektu z "id" i "title"
+        match = re.search(r'"ads"\s*:\s*(\[\s*\{"id"\s*:\s*\d+', html)
+        if match:
+            # Musimy wyciągnąć całą tablicę - szukamy od początku match
+            start = match.start()
+            start_bracket = html.index("[", start + 7)  # pomijamy "ads":
+            # Liczymy nawiasy żeby znaleźć koniec tablicy
+            depth = 0
+            end = start_bracket
+            for i, ch in enumerate(html[start_bracket:], start_bracket):
+                if ch == "[" or ch == "{":
+                    depth += 1
+                elif ch == "]" or ch == "}":
+                    depth -= 1
+                if depth == 0:
+                    end = i + 1
+                    break
+            ads_str = html[start_bracket:end]
+        else:
+            print("Nie znaleziono ofert w HTML")
+            # Wypisujemy fragment HTML wokół słowa 'ads' do debugowania
+            pos = html.find('"ads"')
+            if pos > 0:
+                print(f"Fragment przy pierwszym 'ads' (pos {pos}): {html[pos:pos+200]}")
             return []
-        json_str = match.group(1)
     else:
-        # Odpakowanie: string był serializowany dwukrotnie, odkodowujemy escape'y
-        json_str = match.group(1).encode().decode("unicode_escape")
+        ads_str = match.group(1)
+
+    print(f"Znaleziono fragment ads, długość: {len(ads_str)} znaków")
+    print(f"Pierwsze 300 znaków: {ads_str[:300]}")
 
     try:
-        data = json.loads(json_str)
+        ads = json.loads(ads_str)
     except json.JSONDecodeError as e:
-        print(f"Błąd parsowania JSON pierwszej warstwy: {e}")
-        # Może dane ofert są w innym kluczu - szukamy "listing" w surowym tekście
-        # i próbujemy wyciągnąć fragment
-        listing_match = re.search(r'"listing"\s*:\s*(\{[^}]{100,}\})', raw[:50000])
-        if listing_match:
-            print(f"Znaleziono fragment listing: {listing_match.group(0)[:200]}")
+        print(f"Błąd parsowania listy ads: {e}")
+        print(f"Fragment przy błędzie: {ads_str[max(0,e.pos-100):e.pos+100]}")
         return []
 
-    print(f"Sparsowano JSON, klucze główne: {list(data.keys())[:10]}")
-
-    # Sprawdzamy czy jest klucz listing lub podobny
-    for key in data.keys():
-        if "listing" in key.lower() or "offer" in key.lower() or "ad" in key.lower():
-            print(f"Interesujący klucz: {key} -> typ: {type(data[key])}")
-
-    # Szukamy listy ofert rekurencyjnie
-    ads = znajdz_ads_w_dict(data)
-
-    if not ads:
-        print(f"Nie znaleziono listy ofert. Klucze główne: {list(data.keys())}")
-        # Sprawdzamy czy wartości kluczy to stringi (kolejna warstwa serializacji)
-        for key, val in list(data.items())[:5]:
-            if isinstance(val, str) and len(val) > 100:
-                print(f"Klucz '{key}' zawiera string długości {len(val)}, próba parsowania...")
-                try:
-                    subdata = json.loads(val)
-                    sub_ads = znajdz_ads_w_dict(subdata)
-                    if sub_ads:
-                        print(f"Znaleziono oferty w kluczu '{key}'!")
-                        ads = sub_ads
-                        break
-                except json.JSONDecodeError:
-                    pass
-        if not ads:
-            return []
-
-    print(f"Znaleziono {len(ads)} ogłoszeń łącznie")
+    print(f"Sparsowano {len(ads)} ogłoszeń")
 
     oferty = []
     for ad in ads:
@@ -273,10 +229,12 @@ def sprawdz_rynek(url, rynek, cena_m2_max, seen):
                 if cena_m2 <= cena_m2_max:
                     o["stara_cena_m2"] = stara_cena_m2
                     zmienione.append(o)
+                    print(f"Zmiana ceny: {o['tytul']} — {stara_cena_m2} → {cena_m2} zł/m²")
         else:
             seen[oferta_id] = {"tytul": o["tytul"], "cena_m2": cena_m2, "rynek": nazwa}
             if cena_m2 <= cena_m2_max:
                 nowe.append(o)
+                print(f"Nowa oferta: {o['tytul']} — {cena_m2} zł/m²")
     return nowe, zmienione
 
 def main():
