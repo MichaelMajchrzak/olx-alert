@@ -174,6 +174,7 @@ def pobierz_oferty(url):
         return []
 
     oferty = []
+    debug_wypisane = False
     for ad in ads:
         try:
             oferta_id = str(ad.get("id", ""))
@@ -185,12 +186,25 @@ def pobierz_oferty(url):
                 key = p.get("key", "")
                 val = p.get("value", {})
                 if isinstance(val, dict):
-                    params_dict[key] = val.get("value") or val.get("key")
+                    # OLX trzyma liczby w 'value' lub w 'key' (znormalizowane)
+                    params_dict[key] = val.get("value") if val.get("value") is not None else val.get("key")
                 else:
                     params_dict[key] = val
 
+            # DEBUG: wypisz strukturę pierwszej oferty
+            if not debug_wypisane:
+                print(f"DEBUG params pierwszej oferty: {list(params_dict.keys())}")
+                print(f"DEBUG wartosci: {params_dict}")
+                debug_wypisane = True
+
             cena_raw = params_dict.get("price")
-            powierzchnia_raw = params_dict.get("m")
+            # OLX czasem trzyma powierzchnię pod różnymi kluczami
+            powierzchnia_raw = (
+                params_dict.get("m")
+                or params_dict.get("area")
+                or params_dict.get("floor_area")
+                or params_dict.get("powierzchnia")
+            )
 
             if cena_raw is None or powierzchnia_raw is None:
                 continue
