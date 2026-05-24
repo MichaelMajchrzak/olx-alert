@@ -115,13 +115,12 @@ def pobierz_oferty(url):
             raw_json = script_tag.string
 
     if not raw_json:
-        print("Nie znaleziono danych JSON na stronie OLX.")
-        print(f"Długość strony: {len(resp.text)} znaków")
-        # Zapisujemy fragment strony do debugowania
-        print("Fragment HTML (pierwsze 500 znaków body):")
-        body = soup.find("body")
-        if body:
-            print(body.get_text()[:500])
+        print("Nie znaleziono danych JSON - lista tagów script na stronie:")
+        for i, s in enumerate(soup.find_all("script")):
+            sid = s.get("id", "brak-id")
+            stype = s.get("type", "brak-type")
+            content_preview = (s.string or "")[:80].replace("\n", " ")
+            print(f"  script[{i}] id={sid} type={stype} | {content_preview}")
         return []
 
     # Parsujemy JSON i nawigujemy do listy ofert
