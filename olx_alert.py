@@ -12,15 +12,12 @@ from datetime import datetime
 # USTAWIENIA - tutaj zmieniaj parametry bez dotykania reszty
 # ============================================================
 
-POWIERZCHNIA_MIN = 35        # minimalna powierzchnia w m²
-POWIERZCHNIA_MAX = 45        # maksymalna powierzchnia w m²
+POWIERZCHNIA_MIN = 35
+POWIERZCHNIA_MAX = 45
 
-CENA_M2_WTORNY_MAX = 7800    # max cena za m² dla rynku wtórnego
-CENA_M2_PIERWOTNY_MAX = 9000 # max cena za m² dla rynku pierwotnego
+CENA_M2_WTORNY_MAX = 7800
+CENA_M2_PIERWOTNY_MAX = 9000
 
-# URL-e skopiowane bezpośrednio z przeglądarki po ustawieniu filtrów
-# Jeśli chcesz zmienić dzielnicę/filtry - wejdź na OLX, ustaw filtry
-# ręcznie i skopiuj nowy URL tutaj
 URL_WTORNY = (
     "https://www.olx.pl/nieruchomosci/mieszkania/sprzedaz/lodz/"
     "?search[district_id]=295"
@@ -42,7 +39,7 @@ URL_PIERWOTNY = (
 SEEN_FILE = "seen_offers.json"
 
 # ============================================================
-# FUNKCJE - tutaj już nie musisz nic zmieniać
+# FUNKCJE
 # ============================================================
 
 HEADERS = {
@@ -56,22 +53,16 @@ HEADERS = {
 }
 
 def load_seen():
-    """Wczytuje zapamiętane oferty z pliku JSON."""
     if os.path.exists(SEEN_FILE):
         with open(SEEN_FILE, "r") as f:
             return json.load(f)
     return {}
 
 def save_seen(seen):
-    """Zapisuje oferty do pliku JSON."""
     with open(SEEN_FILE, "w") as f:
         json.dump(seen, f, ensure_ascii=False, indent=2)
 
 def pobierz_oferty(url):
-    """
-    Pobiera oferty z OLX przez scraping strony HTML.
-    OLX wbudowuje dane ofert jako JSON w tagu <script> na stronie.
-    """
     try:
         resp = requests.get(url, headers=HEADERS, timeout=20)
         resp.raise_for_status()
@@ -79,23 +70,19 @@ def pobierz_oferty(url):
         print(f"Błąd pobierania strony: {e}")
         return []
 
-    # Tymczasowe debugowanie - zapisujemy HTML do pliku
-    with open("debug_olx.html", "w", encoding="utf-8") as f:
-        f.write(resp.text)
     print(f"Pobrano stronę: {len(resp.text)} znaków, status: {resp.status_code}")
-
     soup = BeautifulSoup(resp.text, "html.parser")
 
-    # OLX wbudowuje wszystkie dane ofert w JSON wewnątrz tagu <script id="olx-init-config">
-    # lub jako window.__PRERENDERED_STATE__ - szukamy obu
     raw_json = None
+    metoda = None
 
-    # Metoda 1: szukamy tagu script z id="olx-init-config"
+    # Metoda 1: tag script z id="olx-init-config"
     script_tag = soup.find("script", {"id": "olx-init-config"})
     if script_tag and script_tag.string:
         raw_json = script_tag.string
+        metoda = "olx-init-config"
 
-    # Metoda 2: szukamy window.__PRERENDERED_STATE__ w dowolnym tagu script
+    # Metoda 2: window.__PRERENDERED_STATE__
     if not raw_json:
         for script in soup.find_all("script"):
             if script.string and "__PRERENDERED_STATE__" in script.string:
@@ -106,16 +93,18 @@ def pobierz_oferty(url):
                 )
                 if match:
                     raw_json = match.group(1)
+                    metoda = "PRERENDERED_STATE"
                     break
 
-    # Metoda 3: szukamy nextjs __NEXT_DATA__
+    # Metoda 3: __NEXT_DATA__
     if not raw_json:
         script_tag = soup.find("script", {"id": "__NEXT_DATA__"})
         if script_tag and script_tag.string:
             raw_json = script_tag.string
+            metoda = "__NEXT_DATA__"
 
     if not raw_json:
-        print("Nie znaleziono danych JSON - lista tagów script na stronie:")
+        print("Nie znaleziono danych JSON - lista tagów script:")
         for i, s in enumerate(soup.find_all("script")):
             sid = s.get("id", "brak-id")
             stype = s.get("type", "brak-type")
@@ -123,49 +112,42 @@ def pobierz_oferty(url):
             print(f"  script[{i}] id={sid} type={stype} | {content_preview}")
         return []
 
-    # Parsujemy JSON i nawigujemy do listy ofert
+    print(f"Znaleziono JSON metodą: {metoda}, długość: {len(raw_json)} znaków")
+    print(f"Pierwsze 200 znaków JSON: {raw_json[:200]}")
+
     try:
         data = json.loads(raw_json)
     except json.JSONDecodeError as e:
         print(f"Błąd parsowania JSON: {e}")
+        print(f"Fragment przy błędzie (char {e.pos}): '{raw_json[max(0,e.pos-80):e.pos+80]}'")
         return []
 
-    # Szukamy listy ofert w różnych miejscach struktury JSON
-    # (OLX czasem zmienia strukturę)
-    ads = []
-
-    # Próba 1: standardowa ścieżka
+    # Szukamy listy ofert w różnych miejscach struktury
     ads = (
         data.get("listing", {})
         .get("listing", {})
         .get("ads", [])
     )
-
-    # Próba 2: ścieżka nextjs
     if not ads:
         ads = (
             data.get("props", {})
             .get("pageProps", {})
             .get("ads", [])
         )
-
-    # Próba 3: płaska lista
     if not ads:
         ads = data.get("ads", [])
 
     if not ads:
-        print(f"Znaleziono JSON ale brak listy ofert. Klucze: {list(data.keys())}")
+        print(f"Znaleziono JSON ale brak listy ofert. Klucze główne: {list(data.keys())}")
         return []
 
     oferty = []
-
     for ad in ads:
         try:
             oferta_id = str(ad.get("id", ""))
             tytul = ad.get("title", "Brak tytułu")
             link = ad.get("url", "")
 
-            # Wyciągamy parametry oferty (cena, powierzchnia)
             params_dict = {}
             for p in ad.get("params", []):
                 key = p.get("key", "")
@@ -178,21 +160,16 @@ def pobierz_oferty(url):
             cena_raw = params_dict.get("price")
             powierzchnia_raw = params_dict.get("m")
 
-            # Pomijamy oferty bez ceny lub powierzchni
             if cena_raw is None or powierzchnia_raw is None:
                 continue
 
-            # Czyścimy i konwertujemy wartości
             cena = float(
                 str(cena_raw)
                 .replace(" ", "")
                 .replace("\xa0", "")
                 .replace(",", ".")
             )
-            powierzchnia = float(
-                str(powierzchnia_raw)
-                .replace(",", ".")
-            )
+            powierzchnia = float(str(powierzchnia_raw).replace(",", "."))
 
             if not (POWIERZCHNIA_MIN <= powierzchnia <= POWIERZCHNIA_MAX):
                 continue
@@ -215,7 +192,6 @@ def pobierz_oferty(url):
     return oferty
 
 def wyslij_maila(nowe_oferty, zmienione_oferty):
-    """Wysyła maila z nowymi i zmienionymi ofertami."""
     gmail_user = os.environ["GMAIL_USER"]
     gmail_pass = os.environ["GMAIL_PASSWORD"]
     odbiorcy = os.environ["NOTIFY_EMAILS"].split(",")
@@ -244,7 +220,7 @@ def wyslij_maila(nowe_oferty, zmienione_oferty):
             tresc += f"  Link:          {o['url']}\n\n"
 
     tresc += "=" * 50 + "\n"
-    tresc += "Bot sprawdza OLX automatycznie co 10 minut.\n"
+    tresc += "Bot sprawdza OLX automatycznie.\n"
 
     msg = MIMEMultipart()
     msg["From"] = gmail_user
@@ -265,10 +241,6 @@ def wyslij_maila(nowe_oferty, zmienione_oferty):
         raise
 
 def sprawdz_rynek(url, rynek, cena_m2_max, seen):
-    """
-    Sprawdza oferty dla jednego rynku.
-    Zwraca listy nowych i zmienionych ofert.
-    """
     nowe = []
     zmienione = []
     nazwa = "wtórny" if rynek == "secondary" else "pierwotny"
